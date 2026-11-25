@@ -1,0 +1,90 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- Funciones ----------
+    function signedIn() { return request.auth != null; }
+    function me() { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
+    function activeUser() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && me().activo == true;
+    }
+    function isAdmin() { return activeUser() && me().rol == 'admin'; }
+
+    function validUser(d) {
+      return d.keys().hasAll(['nombre', 'email', 'rol', 'activo'])
+        && d.nombre is string && d.nombre.size() >= 1 && d.nombre.size() <= 60
+        && d.email is string && d.email.size() <= 254 && d.email.matches('.+@.+')
+        && d.rol in ['admin', 'usuario']
+        && d.activo is bool;
+    }
+
+    function validEvent(d) {
+      return d.keys().hasOnly(['ts', 'usuario', 'origen', 'tipo', 'detalle'])
+        && d.ts is int
+        && d.usuario is string && d.usuario.size() <= 60
+        && d.origen is string && d.origen.size() <= 20
+        && d.tipo is string && d.tipo.size() <= 20
+        && d.detalle is string && d.detalle.size() <= 300;
+    }
+
+    function validState(d) {
+      return d.keys().hasOnly(['distancia', 'puerta', 'modo', 'conectado', 'pasarela', 'ts'])
+        && d.distancia is int && d.distancia >= 0 && d.distancia <= 999
+        && d.puerta in ['ABIERTA', 'CERRADA']
+        && d.modo in ['AUTO', 'MANUAL']
+        && d.conectado is bool
+        && d.pasarela is string && d.pasarela.size() <= 60
+        && d.ts is int;
+    }
+
+    function validCommand(d) {
+      return d.keys().hasOnly(['cmd', 'ts', 'usuario', 'estado', 'firma'])
+        && d.cmd in ['1', '0', 'A']
+        && d.ts is int
+        && d.usuario is string && d.usuario.size() <= 60
+        && d.estado == 'pendiente'
+        && d.firma is string && d.firma.size() == 32;
+    }
+
+    // ---------- Perfiles y roles ----------
+    // Cada quien lee solo el suyo; el admin lee y administra todos (CRUD).
+    // Un admin no puede quitarse el rol, desactivarse ni borrarse a sí mismo.
+    match /users/{uid} {
+      allow get: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isAdmin() && validUser(request.resource.data);
+      allow update: if isAdmin() && validUser(request.resource.data)
+        && !(request.auth.uid == uid
+             && (request.resource.data.rol != 'admin' || request.resource.data.activo != true));
+      allow delete: if isAdmin() && request.auth.uid != uid;
+    }
+
+    // ---------- Datos del sistema (solo usuarios activos) ----------
+    // La bitácora no se edita ni se borra (solo se permite reenviar el mismo registro).
+    match /eventos/{id} {
+      allow read: if activeUser();
+      allow create: if activeUser() && validEvent(request.resource.data);
+      allow update: if activeUser() && request.resource.data == resource.data;
+      allow delete: if false;
+    }
+
+    match /petdoor/estado {
+      allow read: if activeUser();
+      allow create, update: if activeUser() && validState(request.resource.data);
+      allow delete: if false;
+    }
+
+    // Órdenes remotas: se crean pendientes y solo se les puede cambiar el resultado.
+    match /comandos/{id} {
+      allow read: if activeUser();
+      allow create: if activeUser() && validCommand(request.resource.data);
+      allow update: if activeUser()
+        && resource.data.estado == 'pendiente'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['estado'])
+        && request.resource.data.estado in ['ejecutado', 'rechazado'];
+      allow delete: if false;
+    }
+  }
+}
